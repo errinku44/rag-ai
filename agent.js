@@ -1,88 +1,87 @@
-import OpenAI from "openai";
 import dotenv from "dotenv";
-import data from './data.js';
-import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { Document } from "@langchain/core/documents";
-import { meta } from "zod/v4/core";
-import { OpenAIEmbeddings, ChatOpenAI } from '@langchain/openai';
-import { MemoryVectorStore } from '@langchain/classic/vectorstores/memory';
-import { tool } from '@langchain/core/tools';
-import { z } from 'zod';
+import { ChatOpenAI } from "@langchain/openai";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+import { vectorStore } from "./vectorStore.js";
+
 dotenv.config();
 
-const video1 = data[0];
-const docs = [new Document({ pageContent: video1.transcript, metadata: { video_id: video1.video_id } })];
-
-//Split video into chunk
-const textSplitter = new RecursiveCharacterTextSplitter({
-    chunkSize: 1000,
-    chunkOverlap: 200
-})
-
-const chunks = await textSplitter.splitDocuments(docs);
-//console.log(chunks);
-
-const client = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-});
-
-const embeddings = new OpenAIEmbeddings({
-    model: 'text-embedding-3-small'
-});
-
-const vectorStore = new MemoryVectorStore(embeddings);
-
-await vectorStore.addDocuments(chunks);
-//retrieve the most relevant docs
-const retrieveTool = tool(async ({ query }) => {
-    const relevantDocs =
-        await vectorStore.similaritySearch(
+const retrieveTool = tool(
+    async ({ query }) => {
+        const relevantDocs = await vectorStore.similaritySearch(
             query,
             3
         );
 
-    return relevantDocs
-        .map(doc => doc.pageContent)
-        .join("\n\n");
-}, {
-    name: 'retrieve',
-    description: 'Search the video transcript for relevant information.',
-    schema: z.object({
-        query: z.string(),
-    })
-})
+        return relevantDocs
+            .map((doc) => doc.pageContent)
+            .join("\n\n");
+    },
+    {
+        name: "retrieve",
+        description:
+            "Search the video transcript for relevant information.",
+        schema: z.object({
+            query: z.string(),
+        }),
+    }
+);
 
 const model = new ChatOpenAI({
-    model: "gpt-4o-mini"
+    model: "gpt-4o-mini",
 });
 
-const modelWithTools = model.bindTools([
-    retrieveTool
+const modelWithTools = model.bindTools([retrieveTool]);
+
+const question = process.argv.slice(2).join(" ");
+if (!question) {
+    console.log("Usage:");
+    console.log('node agent.js "What is this video about?"');
+    process.exit(1);
+}
+
+const response = await modelWithTools.invoke([
+    {
+        role: "system",
+        content:
+            "You must use the retrieve tool before answering. Never answer from your own knowledge.",
+    },
+    {
+        role: "user",
+        content: question,
+    },
 ]);
 
-const response = await modelWithTools.invoke(
-    "Which word speaker using frequently?"
-);
+console.log("=========== FIRST RESPONSE ===========");
 console.log(JSON.stringify(response, null, 2));
+
+if (!response.tool_calls?.length) {
+    console.log("\nNo tool call was made.\n");
+    console.log(response.content);
+    process.exit(0);
+}
+
 const toolCall = response.tool_calls[0];
 
-const toolResult = await retrieveTool.invoke(
-    toolCall.args
-);
+const toolResult = await retrieveTool.invoke(toolCall.args);
 
-const finalResponse =
-    await modelWithTools.invoke([
-        {
-            role: "user",
-            content: "Which word speaker using frequently?"
-        },
-        response,
-        {
-            role: "tool",
-            content: toolResult,
-            tool_call_id: toolCall.id
-        }
-    ]);
+const finalResponse = await modelWithTools.invoke([
+    {
+        role: "system",
+        content:
+            "Answer only using the information returned by the retrieve tool.",
+    },
+    {
+        role: "user",
+        content: question,
+    },
+    response,
+    {
+        role: "tool",
+        content: toolResult,
+        tool_call_id: toolCall.id,
+    },                      
+]);
 
+console.log("\n=========== FINAL ANSWER ===========");
 console.log(finalResponse.content);
-
